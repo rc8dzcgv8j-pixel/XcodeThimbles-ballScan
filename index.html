@@ -203,6 +203,50 @@
             margin-left: auto;
         }
 
+        /* Session limit / cooldown alert */
+        .session-counter {
+            margin: -8px 0 18px;
+            text-align: center;
+            color: var(--text-dim);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 11px;
+            letter-spacing: 1px;
+        }
+        .session-counter strong { color: var(--primary); font-size: 13px; }
+        /* Les boîtes sont masquées pendant le cessez-le-feu. */
+        #cups-container.cooldown-hidden { display: none !important; }
+        #cups-container.cooldown-hidden + div { display: none !important; }
+        .session-alert {
+            display: none;
+            margin: 0 0 20px;
+            padding: 16px 14px;
+            text-align: center;
+            color: #ffeb3b;
+            background: rgba(30, 0, 0, 0.94);
+            border: 2px solid #ff2525;
+            border-radius: 12px;
+            font-family: 'Orbitron', sans-serif;
+            font-weight: 800;
+            letter-spacing: 1px;
+            line-height: 1.6;
+            text-shadow: 0 0 7px #ff2525, 0 0 15px rgba(255, 0, 0, .9);
+            box-shadow: 0 0 10px rgba(255, 0, 0, .8), inset 0 0 12px rgba(255, 0, 0, .18);
+        }
+        .session-alert.active {
+            display: block;
+            animation: sessionAlertBlink 1s ease-in-out infinite;
+        }
+        .session-alert .cooldown-time {
+            display: block;
+            margin-top: 5px;
+            font-size: 20px;
+            color: #fff176;
+        }
+        @keyframes sessionAlertBlink {
+            0%, 100% { border-color: #ff2525; box-shadow: 0 0 8px #ff2525, inset 0 0 8px rgba(255,0,0,.18); }
+            50% { border-color: #ff8a80; box-shadow: 0 0 22px #ff1010, 0 0 32px rgba(255,0,0,.65), inset 0 0 14px rgba(255,0,0,.3); }
+        }
+
         /* Control Panel */
         .control-section {
             background: var(--bg-card);
@@ -1109,6 +1153,12 @@
             <span class="ws-data-badge" id="ws-data-count">0 msgs</span>
         </div>
 
+        <div class="session-counter">JEU DE SESSION : <strong id="session-game-count">0 / 15</strong></div>
+        <div class="session-alert" id="session-alert" role="alert" aria-live="assertive">
+            <span id="session-alert-message">ALERTES : CESSER DE JOUER, PUIS REVENEZ DANS 10 MINUTES.</span>
+            <span class="cooldown-time" id="cooldown-time"></span>
+        </div>
+
         <!-- Control Section -->
         <section class="control-section">
             <div class="input-group">
@@ -1179,6 +1229,7 @@
                     <span class="cup-number">3</span>
                     <div class="cup-select-circle"></div>
                 </div>
+                <button id="mark-loss-btn" type="button" aria-label="Signaler une prédiction échouée" disabled style="align-self:center; flex:0 0 auto; padding:12px 10px; border:2px solid #ff3333; border-radius:10px; background:#b91c1c; color:white; font-family:'Orbitron',sans-serif; font-size:10px; font-weight:700; cursor:pointer; box-shadow:0 0 14px rgba(255,40,40,.35); opacity:.45;">ÉCHEC ✕</button>
             </div>
             <div style="text-align:center;font-size:11px;color:var(--text-dim);margin-top:8px;">
                 Quand <b>JOUER</b> apparaît → pointe la boîte <b>SANS boule</b> avant la fin du compte à rebours
@@ -1273,7 +1324,14 @@
                 stats: {
                     games: 0,
                     correct: 0,
-                    attempts: 0
+                    attempts: 0,
+                    consecutiveLosses: 0,
+                    pendingRound: null,
+                    recoveryPending: false,
+                    recoveryAttempts: 0,
+                    sessionGames: Number(localStorage.getItem('thimbleSessionGames') || 0),
+                    cooldownUntil: Number(localStorage.getItem('thimbleCooldownUntil') || 0),
+                    resumeAfterCooldown: false
                 },
                 // WebSocket state
                 ws: null,
@@ -1330,7 +1388,12 @@
                 captureStatus: document.getElementById('capture-status'),
                 capturePreview: document.getElementById('capture-preview'),
                 captureVideo: document.getElementById('capture-video'),
-                captureWarning: document.getElementById('capture-warning')
+                captureWarning: document.getElementById('capture-warning'),
+                markLossBtn: document.getElementById('mark-loss-btn'),
+                sessionAlert: document.getElementById('session-alert'),
+                sessionAlertMessage: document.getElementById('session-alert-message'),
+                cooldownTime: document.getElementById('cooldown-time'),
+                sessionGameCount: document.getElementById('session-game-count')
             };
 
             // Jouer alert timing variables
@@ -1664,6 +1727,69 @@
                 return Math.floor(Math.random() * max);
             }
 
+            // Pause obligatoire de 10 minutes après le 15e jeu, après une victoire au 14e,
+            // ou après deux tentatives de rattrapage ratées.
+            let cooldownInterval = null;
+
+            function formatRemaining(ms) {
+                const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+                const hours = Math.floor(totalSeconds / 3600);
+                const minutes = Math.floor((totalSeconds % 3600) / 60);
+                const seconds = totalSeconds % 60;
+                return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+            }
+
+            function updateCooldownUI() {
+                const remaining = state.stats.cooldownUntil - Date.now();
+                if (remaining > 0) {
+                    el.sessionAlert.classList.add('active');
+                    el.sessionAlertMessage.textContent = 'ALERTES : CESSER DE JOUER, PUIS REVENEZ DANS 10 MINUTES.';
+                    el.cooldownTime.textContent = `REPRISE DANS ${formatRemaining(remaining)}`;
+                    el.cupsContainer.classList.add('cooldown-hidden');
+                    el.startBtn.disabled = true;
+                    el.stopBtn.disabled = true;
+                    return true;
+                }
+
+                let cooldownJustEnded = false;
+                if (state.stats.cooldownUntil) {
+                    state.stats.cooldownUntil = 0;
+                    localStorage.removeItem('thimbleCooldownUntil');
+                    state.stats.sessionGames = 0;
+                    localStorage.removeItem('thimbleSessionGames');
+                    el.sessionGameCount.textContent = '0 / 15';
+                    cooldownJustEnded = true;
+                    logToConsole('Pause terminée. Les boîtes réapparaissent et le compteur de session est remis à zéro.', 'info');
+                }
+                el.sessionAlert.classList.remove('active');
+                el.cooldownTime.textContent = '';
+                el.cupsContainer.classList.remove('cooldown-hidden');
+                if (!state.isRunning) el.startBtn.disabled = false;
+
+                // Si la détection tournait avant l'alerte, elle reprend automatiquement.
+                if (cooldownJustEnded && state.stats.resumeAfterCooldown) {
+                    state.stats.resumeAfterCooldown = false;
+                    startDetection();
+                }
+                return false;
+            }
+
+            function startCooldown(reason) {
+                state.stats.resumeAfterCooldown = state.isRunning;
+                state.stats.cooldownUntil = Date.now() + 10 * 60 * 1000;
+                localStorage.setItem('thimbleCooldownUntil', String(state.stats.cooldownUntil));
+                stopDetection();
+                // stopDetection arrête la détection, mais le drapeau conserve la reprise automatique.
+                el.cupsContainer.classList.add('cooldown-hidden');
+                el.predictionLabel.textContent = 'Cessez le jeu : pause obligatoire de 10 minutes.';
+                logToConsole(`Alerte déclenchée — cessez de jouer pendant 10 minutes : ${reason}`, 'error');
+                updateCooldownUI();
+            }
+
+            el.sessionGameCount.textContent = `${state.stats.sessionGames} / 15`;
+            cooldownInterval = setInterval(updateCooldownUI, 1000);
+            updateCooldownUI();
+
             // Update stats display
             function updateStats() {
                 const accuracy = state.stats.attempts > 0
@@ -1733,6 +1859,61 @@
                         Gobelet ${item.cup} ${item.isLive ? '◉' : (item.isCorrect ? '✓' : '✗')}
                     </span>`;
                 }).join('');
+            }
+
+            // Valide une manche : sans clic sur ÉCHEC, la manche est considérée gagnante.
+            function settlePendingRound(isCorrect) {
+                const round = state.stats.pendingRound;
+                if (!round || round.settled) return;
+                round.settled = true;
+                state.stats.games++;
+                state.stats.sessionGames++;
+                localStorage.setItem('thimbleSessionGames', String(state.stats.sessionGames));
+                el.sessionGameCount.textContent = `${state.stats.sessionGames} / 15`;
+                if (isCorrect) {
+                    state.stats.correct++;
+                    state.stats.consecutiveLosses = 0;
+                    if (round.isRecovery) {
+                        state.stats.recoveryPending = false;
+                        logToConsole(`Rattrapage réussi (${state.stats.recoveryAttempts}/2 utilisés) : retour au mode normal.`, 'success');
+                    }
+                } else {
+                    state.stats.consecutiveLosses++;
+                    if (!round.isRecovery) {
+                        state.stats.recoveryPending = true;
+                        state.stats.recoveryAttempts = 0;
+                    }
+                }
+                addHistory(round.cup, isCorrect, false);
+                updateStats();
+                state.stats.pendingRound = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
+                el.markLossBtn.textContent = isCorrect ? 'VALIDÉ ✓' : 'ÉCHEC ✕';
+                logToConsole(isCorrect ? 'Manche validée (aucun échec signalé).' : `Échec signalé. Pertes consécutives : ${state.stats.consecutiveLosses}.`, isCorrect ? 'success' : 'error');
+
+                // Limite de session : victoire au 14e = arrêt immédiat ; si le 14e est perdu,
+                // le cycle peut continuer jusqu'au 15e, qui déclenche toujours la pause.
+                if ((state.stats.sessionGames === 14 && isCorrect) || state.stats.sessionGames >= 15) {
+                    startCooldown(state.stats.sessionGames === 14 ? 'victoire au 14e jeu' : '15 jeux atteints');
+                    return;
+                }
+
+                // Garde-fou conservé : deux pertes consécutives déclenchent une pause.
+                if (state.stats.consecutiveLosses >= 2) {
+                    startCooldown('deux échecs consécutifs');
+                    return;
+                }
+
+                // Deux rattrapages maximum par session, même s'ils ont été réussis.
+                if (!isCorrect && !round.isRecovery && state.stats.recoveryAttempts >= 2) {
+                    startCooldown('limite de deux rattrapages atteinte');
+                    return;
+                }
+                if (round.isRecovery && !isCorrect && state.stats.recoveryAttempts >= 2) {
+                    startCooldown('deux tentatives de rattrapage utilisées');
+                    return;
+                }
             }
 
             // Generate prediction based on live WebSocket data
@@ -1839,7 +2020,7 @@
 
             // Run prediction cycle
             function runPrediction() {
-                if (!state.isRunning) return;
+                if (!state.isRunning || updateCooldownUI()) return;
 
                 // TIMING
                 const jouerDuration = 5000;          // JOUER + temps pour pointer la boîte SANS boule
@@ -1848,6 +2029,9 @@
 
                 // Reset sélection précédente
                 state.emptyBoxSelected = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
+                el.markLossBtn.textContent = 'ÉCHEC ✕';
                 document.querySelectorAll('.cup-item').forEach(item => {
                     item.classList.remove('manual-selected', 'active', 'sensor-red');
                 });
@@ -1896,19 +2080,26 @@
                     showPrediction(prediction);
                     el.predictionLabel.textContent = `Position : Gobelet ${prediction} (boîte ${empty} sans boule)`;
                     state.stats.attempts++;
+                    const isRecovery = state.stats.recoveryPending;
+                    if (isRecovery) state.stats.recoveryAttempts++;
+                    state.stats.pendingRound = { cup: prediction, settled: false, isRecovery };
+                    if (isRecovery) {
+                        el.predictionLabel.textContent = `RATTRAPAGE ${state.stats.recoveryAttempts}/2 — Increase x2/x3 | Gobelet ${prediction}`;
+                        logToConsole(`Mode rattrapage ${state.stats.recoveryAttempts}/2 : Increase x2/x3 (indication uniquement, mise non automatisée).`, 'error');
+                    }
+                    el.markLossBtn.disabled = false;
+                    el.markLossBtn.style.opacity = '1';
+                    el.markLossBtn.textContent = 'ÉCHEC ✕';
+                    updateStats();
                     logToConsole(`Prédiction → Gobelet ${prediction} | Boîte vide pointée : ${empty}`, 'success');
 
                     // La position reste 7 secondes
                     setTimeout(() => {
                         if (!state.isRunning) return;
 
-                        // Enregistrement stats (basique)
-                        let actual = state.liveData.lastResults[0] || prediction;
-                        const isCorrect = prediction === actual;
-                        state.stats.games++;
-                        if (isCorrect) state.stats.correct++;
-                        addHistory(prediction, isCorrect, !!state.liveData.lastResults[0]);
-                        updateStats();
+                        // Si aucun clic sur ÉCHEC avant la fin de la manche, elle est validée.
+                        settlePendingRound(true);
+                        if (!state.isRunning || updateCooldownUI()) return;
 
                         // Reset
                         el.predictionValue.textContent = '—';
@@ -1930,6 +2121,10 @@
 
             // Start detection
             function startDetection() {
+                if (updateCooldownUI()) {
+                    el.predictionLabel.textContent = 'Pause obligatoire : attendez la fin du compte à rebours.';
+                    return;
+                }
                 const id = el.accountInput.value.trim();
                 const ALLOWED_ID = '1492229825';
 
@@ -1968,6 +2163,9 @@
             // Stop detection
             function stopDetection() {
                 state.isRunning = false;
+                state.stats.pendingRound = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
 
                 // Disconnect WebSocket
                 disconnectWebSocket();
@@ -1978,7 +2176,7 @@
                 // Optionally keep capture running so user doesn't have to re-share every time
                 // stopScreenCapture();
 
-                el.startBtn.disabled = false;
+                el.startBtn.disabled = state.stats.cooldownUntil > Date.now();
                 el.stopBtn.disabled = true;
                 el.predictionStatus.classList.add('inactive');
                 el.statusText.textContent = 'Inactif';
@@ -2020,6 +2218,9 @@
                 el.overlay.classList.add('hidden');
             }
 
+            el.markLossBtn.disabled = true;
+            el.markLossBtn.style.opacity = '0.45';
+
             // Event listeners
             el.overlayBtn.addEventListener('click', activateSystem);
             el.overlayInput.addEventListener('keypress', e => {
@@ -2030,11 +2231,22 @@
             el.stopBtn.addEventListener('click', stopDetection);
             el.captureBtn.addEventListener('click', startScreenCapture);
 
+            el.markLossBtn.addEventListener('click', () => {
+                if (!state.stats.pendingRound || state.stats.pendingRound.settled) return;
+                settlePendingRound(false);
+                el.predictionLabel.textContent = state.isRunning
+                    ? 'Échec enregistré manuellement. Attends le prochain tour.'
+                    : 'Pause de sécurité après 2 échecs consécutifs.';
+            });
+
             el.clearHistory.addEventListener('click', () => {
                 state.history = [];
-                state.stats = { games: 0, correct: 0, attempts: 0 };
+                state.stats = { games: 0, correct: 0, attempts: 0, consecutiveLosses: 0, pendingRound: null, recoveryPending: false, recoveryAttempts: 0, sessionGames: state.stats.sessionGames, cooldownUntil: state.stats.cooldownUntil, resumeAfterCooldown: state.stats.resumeAfterCooldown };
                 state.liveData.lastResults = [];
                 state.emptyBoxSelected = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
+                el.markLossBtn.textContent = 'ÉCHEC ✕';
                 document.querySelectorAll('.cup-item').forEach(item => {
                     item.classList.remove('manual-selected', 'active', 'sensor-red');
                 });
